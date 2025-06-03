@@ -2,6 +2,11 @@
 from lxml import etree
 from odoo import _, api, models
 from odoo.exceptions import UserError
+import socket
+import xml.etree.ElementTree
+
+from pyafipws.wsaa import WSAA
+from pyafipws.wsmtx import WSMTXCA
 
 
 class AccountJournal(models.Model):
@@ -47,62 +52,63 @@ class AccountJournal(models.Model):
             )
         return super()._get_codes_per_journal_type(afip_pos_system)
 
+    def _handle_afip_error(self, error_msg):
+        """Maneja errores de AFIP mostrando un mensaje al usuario"""
+        raise UserError(_("Error AFIP: %s") % error_msg)
+
+    def _handle_wsmtxca_exception(self, exception):
+        """Maneja excepciones específicas de WSMTXCA"""
+        error_msg = str(exception)
+        if isinstance(exception, (socket.error, TimeoutError)):
+            error_msg = _("Error de conexión con AFIP: %s") % error_msg
+        elif isinstance(exception, xml.etree.ElementTree.ParseError):
+            error_msg = _("Error al parsear respuesta de AFIP: %s") % error_msg
+        self._handle_afip_error(error_msg)
+
     def _l10n_ar_get_afip_last_invoice_number(self, document_type):
         self.ensure_one()
         if self.env.registry.in_test_mode():
             return 0
-        # return 0
-        # import wdb; wdb.set_trace()
-
+        
         pos_number = self.l10n_ar_afip_pos_number
         afip_ws = self.l10n_ar_afip_ws
         connection = self.company_id._l10n_ar_get_connection(afip_ws)
-        client, auth = connection._get_client()
-        last = errors = False
-
+        _, auth = connection._get_client()
+        
         res = super()._l10n_ar_get_afip_last_invoice_number(document_type)
 
         if afip_ws == "wsmtxca":
-
             wsdl = connection._l10n_ar_get_afip_ws_url(afip_ws, connection.type)
-
-            # Crear instancia del cliente WSMTXCA
-            from pyafipws.wsaa import WSAA
-            from pyafipws.wsmtx import WSMTXCA
-
             wsmtxca_client = WSMTXCA()
 
-            # Configurar conexión (usar WSDL de homologación o producción)
-            wsmtxca_client.Conectar(wsdl=wsdl)
-
-            # Obtener ticket de acceso correctamente formateado
-            wsaa_client = WSAA()
-            wsaa_client.Autenticar(
-                "wsmtxca",
-                self.company_id.l10n_ar_afip_ws_crt,
-                self.company_id.l10n_ar_afip_ws_key,
-            )
-
-            # Configurar autenticación
-            wsmtxca_client.Cuit = auth["Cuit"]
-            wsmtxca_client.Token = auth["Token"]
-            wsmtxca_client.Sign = auth["Sign"]
-
-            # 5. Realizar consulta
             try:
-                # response = wsmtxca_client.ConsultarUltimoComprobanteAutorizado(auth, pos_number, document_type.code)
-                # response = client.CompUltimoAutorizado()
+                # Configurar conexión
+                wsmtxca_client.Conectar(wsdl=wsdl)
+
+                # Obtener ticket de acceso
+                wsaa_client = WSAA()
+                wsaa_client.Autenticar(
+                    "wsmtxca",
+                    self.company_id.l10n_ar_afip_ws_crt,
+                    self.company_id.l10n_ar_afip_ws_key,
+                )
+
+                # Configurar autenticación
+                wsmtxca_client.Cuit = auth["Cuit"]
+                wsmtxca_client.Token = auth["Token"]
+                wsmtxca_client.Sign = auth["Sign"]
+
+                # Realizar consulta
                 response = wsmtxca_client.ConsultarUltimoComprobanteAutorizado(
                     document_type.code, pos_number
                 )
 
-                # 1. Primero verificar si tenemos CbteNro directamente
+                # 1. Verificar CbteNro directamente
                 if hasattr(response, "CbteNro") and response.CbteNro:
                     return response.CbteNro
 
-                # 2. Si no hay CbteNro, verificar la respuesta XML
+                # 2. Verificar respuesta XML
                 if hasattr(response, "XmlResponse") and response.XmlResponse:
-                    # Parsear XML para buscar número de comprobante o errores
                     xml_data = self.parse_afip_xml_response(response.XmlResponse)
 
                     if xml_data.get("numeroComprobante"):
@@ -110,26 +116,26 @@ class AccountJournal(models.Model):
 
                     if xml_data.get("errores"):
                         error_msg = "\n".join(
-                            [
-                                f"{e['codigo']}: {e['descripcion']}"
-                                for e in xml_data["errores"]
-                            ]
+                            [f"{e['codigo']}: {e['descripcion']}" for e in xml_data["errores"]]
                         )
-                        raise UserError(_(f"Error AFIP:\n{error_msg}"))
+                        self._handle_afip_error(error_msg)
 
-                # 3. Si no encontramos nada, devolver 0 (para nuevo punto de venta)
+                # 3. Si no encontramos nada, devolver 0
                 return 0
 
-            except Exception as e:
-                raise UserError(_("Error en la consulta a AFIP: %s") % str(e))
+            except (socket.error, TimeoutError, xml.etree.ElementTree.ParseError) as e:
+                self._handle_wsmtxca_exception(e)
+            except Exception as e:  # noqa: BLE001
+                # Solo para errores realmente inesperados que no podemos manejar específicamente
+                self._handle_afip_error(_("Error inesperado en la consulta a AFIP: %s") % str(e))
 
         return res
 
     def parse_afip_xml_response(self, xml_response):
         """Parsea la respuesta XML de AFIP y extrae datos relevantes"""
-        try:
-            result = {"errores": [], "numeroComprobante": None}
+        result = {"errores": [], "numeroComprobante": None}
 
+        try:
             # Decodificar si es necesario
             xml_str = (
                 xml_response.decode("utf-8")
@@ -153,18 +159,15 @@ class AccountJournal(models.Model):
                 result["errores"].append(
                     {
                         "codigo": error.find("ns1:codigo", namespaces=ns).text,
-                        "descripcion": error.find(
-                            "ns1:descripcion", namespaces=ns
-                        ).text,
+                        "descripcion": error.find("ns1:descripcion", namespaces=ns).text,
                     }
                 )
 
-            return result
+        except (etree.ParseError, AttributeError, ValueError) as e:
+            result["errores"].append({"codigo": "PARSE_ERROR", "descripcion": str(e)})
+        
+        return result
 
-        except Exception as e:
-            return {"errores": [{"codigo": "PARSE_ERROR", "descripcion": str(e)}]}
-
-    # TODO - este me deja dudas
     def l10n_ar_check_afip_pos_number(self):
         self.ensure_one()
         connection = self.company_id._l10n_ar_get_connection(self.l10n_ar_afip_ws)

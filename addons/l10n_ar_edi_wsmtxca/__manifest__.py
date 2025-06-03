@@ -9,6 +9,7 @@
     "license": "AGPL-3",
     "category": "Accounting",
     "version": "16.0.1.0.0",
+    "email": "cmanuel.alvarez11@gmail.com",
     "installable": True,
     "application": False,
     "depends": [
@@ -17,6 +18,6 @@
         "account_accountant",
     ],
     "data": [
-        # "views/report_invoice.xml",
+       
     ],
 }

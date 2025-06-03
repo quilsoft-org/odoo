@@ -1,5 +1,10 @@
 # Part of Odoo. See LICENSE file for full copyright and licensing details.
 from datetime import datetime
+import re
+import socket
+import xml.etree.ElementTree as etree
+from pyafipws.wsaa import WSAA
+from pyafipws.wsmtx import WSMTXCA
 
 from odoo import _, models
 from odoo.tools.float_utils import float_repr
@@ -9,6 +14,21 @@ xWS_DATE_FORMAT = {"wsmtxca": "%Y-%m-%d"}
 
 class AccountMove(models.Model):
     _inherit = "account.move"
+
+    def _handle_afip_error(self, error_msg):
+        """Maneja errores de AFIP mostrando un mensaje al usuario"""
+        if not self.env.context.get("l10n_ar_invoice_skip_commit"):
+            self.env.cr.rollback()
+        return error_msg
+
+    def _handle_wsmtxca_exception(self, exception):
+        """Maneja excepciones específicas de WSMTXCA"""
+        error_msg = str(exception)
+        if isinstance(exception, (socket.error, TimeoutError)):
+            error_msg = _("Error de conexión con AFIP: %s") % error_msg
+        elif isinstance(exception, etree.ParseError):
+            error_msg = _("Error al parsear respuesta de AFIP: %s") % error_msg
+        return self._handle_afip_error(_("AFIP Exception:\n") + error_msg)
 
     def _l10n_ar_do_afip_ws_request_cae(self, client, auth, transport):
         self.ensure_one()
@@ -22,10 +42,6 @@ class AccountMove(models.Model):
                 wsdl = connection._l10n_ar_get_afip_ws_url(afip_ws, connection.type)
 
                 client, auth = connection._get_client()
-
-                # Crear instancia del cliente WSMTXCA
-                from pyafipws.wsaa import WSAA
-                from pyafipws.wsmtx import WSMTXCA
 
                 wsmtxca_client = WSMTXCA()
 
@@ -53,7 +69,6 @@ class AccountMove(models.Model):
 
                 # Procesar la respuesta
                 code_due_date = False
-                # import wdb; wdb.set_trace()
                 if wsmtxca_client.Resultado in ("A", "O"):  # Aprobado u Observado
                     code_due_date = wsmtxca_client.Vencimiento
                     if code_due_date:
@@ -72,22 +87,9 @@ class AccountMove(models.Model):
 
                     # Guardar los datos en la factura
                     self.sudo().write(values)
-
-                    # Procesar observaciones si las hay
-                    # return_info = ""
-                    # if wsmtxca_client.Observaciones:
-                    #    return_info = _("AFIP Observations:\n") + wsmtxca_client.Obs
-                    #    self.message_post(
-                    #        body="<p><b>"
-                    #        + _("AFIP Messages")
-                    #        + "</b></p>"
-                    #        + plaintext2html(return_info, "em")
-                    #    )
-
-                    # return return_info
                 else:
                     # Hubo errores, preparar mensaje de error
-                    error_msg = _("AFIP Error:\n") + (
+                    error_msg = _("AFIP Error: %s") % (
                         wsmtxca_client.ErrMsg or "Error desconocido"
                     )
                     if not self.env.context.get("l10n_ar_invoice_skip_commit"):
@@ -100,13 +102,12 @@ class AccountMove(models.Model):
                         }
                     )
 
-                    return error_msg
+                    return self._handle_afip_error(error_msg)
 
-            except Exception as e:
-                error_msg = _("AFIP Exception:\n") + str(e)
-                if not self.env.context.get("l10n_ar_invoice_skip_commit"):
-                    self.env.cr.rollback()
-                return error_msg
+            except (socket.error, TimeoutError, etree.ParseError) as e:
+                return self._handle_wsmtxca_exception(e)
+            except Exception as e:  # noqa: BLE001
+                return self._handle_afip_error(_("AFIP Exception: %s") % str(e))
 
         # Si no es WSMTXCA, llamamos al método original
         return super()._l10n_ar_do_afip_ws_request_cae(client, auth, transport)
@@ -266,10 +267,7 @@ class AccountMove(models.Model):
             else:
                 cod_mtx = ""  # si no es GTIN válido, se envía vacío
 
-            if data["iva"]:
-                imp_iva = float_repr(float(data["iva"]), precision_digits=2)
-            else:
-                float_repr(float(0.00), precision_digits=2)
+            imp_iva = float_repr(float(data["iva"]), precision_digits=2) if data["iva"] else "0.00"
 
             if data["price_unit"] < 0 or data["qty"] < 0:
                 client.AgregarItem(
@@ -282,7 +280,6 @@ class AccountMove(models.Model):
                     ),
                 )
             else:
-
                 client.AgregarItem(
                     u_mtx=(
                         line.product_id.uom_id.l10n_ar_afip_code
@@ -334,14 +331,12 @@ class AccountMove(models.Model):
             )
 
         if self.reversed_entry_id:
-            nro = int(
-                self.reversed_entry_id.l10n_latam_document_number.replace("-", "")
-            )
+            # La variable nro no se usa, así que la eliminamos
+            int(self.reversed_entry_id.l10n_latam_document_number.replace("-", ""))
             client.AgregarCmpAsoc(
                 tipo=int(self.reversed_entry_id.l10n_latam_document_type_id.code),
                 pto_vta=int(self.reversed_entry_id.journal_id.l10n_ar_afip_pos_number),
                 nro=invoice_number,
-                # cuit=company.vat,
                 fecha=self.reversed_entry_id.invoice_date.strftime(
                     xWS_DATE_FORMAT["wsmtxca"]
                 ),

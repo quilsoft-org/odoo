@@ -2,6 +2,9 @@
 from odoo import _, api, fields, models
 from odoo.exceptions import UserError
 
+from pyafipws.wsaa import WSAA
+from pyafipws.wsmtx import WSMTXCA
+
 
 class L10nArAfipwsConnection(models.Model):
     _inherit = "l10n_ar.afipws.connection"
@@ -45,24 +48,14 @@ class L10nArAfipWsConsult(models.TransientModel):
             )
         if not self.number:
             raise UserError(_("Please set the number you want to consult"))
-
-        connection = self.journal_id.company_id._l10n_ar_get_connection(afip_ws)
-        client, auth = connection._get_client()
-
-        res = error = False
-        # We need to call a different method for every webservice type and assemble the returned errors if they exist
+       
         if afip_ws == "wsmtxca":
-            afip_ws = self.journal_id.l10n_ar_afip_ws
             connection = self.journal_id.company_id._l10n_ar_get_connection(afip_ws)
-
             wsdl = connection._l10n_ar_get_afip_ws_url(afip_ws, connection.type)
 
-            client, auth = connection._get_client()
+            _, auth = connection._get_client()
 
             # Crear instancia del cliente WSMTXCA
-            from pyafipws.wsaa import WSAA
-            from pyafipws.wsmtx import WSMTXCA
-
             wsmtxca_client = WSMTXCA()
 
             # Configurar conexión (usar WSDL de homologación o producción)
@@ -70,16 +63,25 @@ class L10nArAfipWsConsult(models.TransientModel):
 
             # Obtener ticket de acceso correctamente formateado
             wsaa_client = WSAA()
-            wsaa_client.Autenticar(
-                "wsmtxca",
-                self.journal_id.company_id.l10n_ar_afip_ws_crt,
-                self.journal_id.company_id.l10n_ar_afip_ws_key,
-            )
+            
+            if not (auth.get("Token") and auth.get("Sign")): # Si _get_client no proveyó Token/Sign
+                wsaa_client.Autenticar(
+                    "wsmtxca",
+                    connection.company_id.l10n_ar_afip_ws_crt, # Usar connection.company_id
+                    connection.company_id.l10n_ar_afip_ws_key, # Usar connection.company_id
+                    url=connection._l10n_ar_get_afip_ws_url("wsaa", connection.type),
+                )
+                # Usar el Token y Sign recién obtenidos si WSAA() se usó para autenticar ahora
+                wsmtxca_client.Token = wsaa_client.Token
+                wsmtxca_client.Sign = wsaa_client.Sign
+            else:
+                # Usar Token y Sign de auth si ya estaban presentes
+                wsmtxca_client.Token = auth["Token"]
+                wsmtxca_client.Sign = auth["Sign"]
 
-            # Configurar autenticación
+            # Configurar CUIT (viene de auth, que a su vez lo toma de la compañía)
             wsmtxca_client.Cuit = auth["Cuit"]
-            wsmtxca_client.Token = auth["Token"]
-            wsmtxca_client.Sign = auth["Sign"]
+
 
             tipo_cbte = self.document_type_id.code
             punto_vta = self.journal_id.l10n_ar_afip_pos_number
@@ -87,4 +89,9 @@ class L10nArAfipWsConsult(models.TransientModel):
             response = wsmtxca_client.ConsultarUltimoComprobanteAutorizado(
                 tipo_cbte, punto_vta
             )
-            raise UserError(_("Ult. comprobante") + response)
+            
+            if wsmtxca_client.CodigoError:
+                 raise UserError(_("Error al consultar último comprobante: %s - %s") % (wsmtxca_client.CodigoError, wsmtxca_client.MsgError))
+            raise UserError(_("Últ. comprobante: %s") % response)
+       
+        return True
